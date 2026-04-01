@@ -1,6 +1,8 @@
 # compose-logs
 
-An interactive TUI for streaming Docker Compose logs. Toggle services on/off, scroll through history, and pretty-print JSON structured logs — all from your terminal.
+An interactive TUI for streaming Docker logs. Toggle services on/off, scroll through history, and pretty-print JSON structured logs — all from your terminal.
+
+Works with **Docker Compose** and **plain Docker containers**. Auto-detects which mode to use: if a compose file exists in the current or parent directory, it uses Compose; otherwise it falls back to listing all Docker containers.
 
 ## Install
 
@@ -10,7 +12,7 @@ go install github.com/abarrell/compose-logs@latest
 
 ## Usage
 
-Run from any directory containing a `docker-compose.yml` (or parent directory):
+Run from any directory. If a compose file is found, services come from Compose. Otherwise, all Docker containers are listed:
 
 ```bash
 compose-logs                  # start with all running services active
@@ -57,4 +59,4 @@ Nested JSON values are indented and unicode escapes (e.g. `\u0026`) are resolved
 ## Requirements
 
 - Go 1.24+
-- Docker Compose v2
+- Docker (with or without Compose)

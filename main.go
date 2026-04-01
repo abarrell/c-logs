@@ -52,20 +52,29 @@ type svcInfo struct {
 	running bool
 }
 
-type model struct {
-	composeDir string
-	tail       int
-	services   []svcInfo
-	active     map[string]bool
-	cancels    map[string]context.CancelFunc
-	lines      []logEntry
-	logCh      chan logEntry
-	width      int
-	height     int
-	ready      bool
-	quitting   bool
+// backend abstracts service discovery and log streaming for different Docker modes.
+type backend interface {
+	// AllServices returns all known service/container names.
+	AllServices() ([]string, error)
+	// RunningServices returns only running service/container names.
+	RunningServices() ([]string, error)
+	// StreamLogs streams logs for the named service into ch. Blocks until ctx is cancelled.
+	StreamLogs(ctx context.Context, name string, tail int, ch chan<- logEntry)
+}
 
-	// Scroll: 0 = pinned to bottom (auto-scroll). >0 = scrolled up by N lines.
+type model struct {
+	backend backend
+	tail    int
+
+	services     []svcInfo
+	active       map[string]bool
+	cancels      map[string]context.CancelFunc
+	lines        []logEntry
+	logCh        chan logEntry
+	width        int
+	height       int
+	ready        bool
+	quitting     bool
 	scrollOffset int
 	prettyJSON   bool
 }
@@ -100,10 +109,11 @@ func main() {
 		}
 	}
 
-	composeDir, err := findComposeDir()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	var be backend
+	if dir, err := findComposeDir(); err == nil {
+		be = &composeBackend{dir: dir}
+	} else {
+		be = &dockerBackend{}
 	}
 
 	active := make(map[string]bool)
@@ -112,7 +122,7 @@ func main() {
 	}
 
 	m := model{
-		composeDir: composeDir,
+		backend:    be,
 		tail:       tail,
 		active:     active,
 		cancels:    make(map[string]context.CancelFunc),
@@ -130,12 +140,14 @@ func main() {
 const appName = "compose-logs"
 
 func printUsage() {
-	fmt.Printf(`%s — interactive Docker Compose log viewer
+	fmt.Printf(`%s — interactive Docker log viewer
 
 Usage:
   %s                    start with all running services active
   %s web api            start with specific services active
   %s -n 200             show last 200 lines of history per service
+
+Auto-detects Docker Compose (if a compose file exists) or falls back to plain Docker containers.
 
 Controls (while running):
   1-9, 0        toggle service by number
@@ -160,15 +172,15 @@ Flags:
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
-		loadServices(m.composeDir),
+		loadServices(m.backend),
 		listenForLog(m.logCh),
 	)
 }
 
-func loadServices(composeDir string) tea.Cmd {
+func loadServices(be backend) tea.Cmd {
 	return func() tea.Msg {
-		all, _ := getAllServices(composeDir)
-		running, _ := getRunningServices(composeDir)
+		all, _ := be.AllServices()
+		running, _ := be.RunningServices()
 		runSet := make(map[string]bool, len(running))
 		for _, s := range running {
 			runSet[s] = true
@@ -205,7 +217,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		for name := range m.active {
-			startStreaming(m.cancels, m.composeDir, name, m.tail, m.logCh)
+			startStreaming(m.cancels, m.backend, name, m.tail, m.logCh)
 		}
 		return m, nil
 
@@ -262,7 +274,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "a":
 			for _, s := range m.services {
 				m.active[s.name] = true
-				startStreaming(m.cancels, m.composeDir, s.name, m.tail, m.logCh)
+				startStreaming(m.cancels, m.backend, s.name, m.tail, m.logCh)
 			}
 			return m, nil
 		case "n":
@@ -275,7 +287,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for _, s := range m.services {
 				if s.running {
 					m.active[s.name] = true
-					startStreaming(m.cancels, m.composeDir, s.name, m.tail, m.logCh)
+					startStreaming(m.cancels, m.backend, s.name, m.tail, m.logCh)
 				}
 			}
 			return m, nil
@@ -298,7 +310,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					stopStreaming(m.cancels, name)
 				} else {
 					m.active[name] = true
-					startStreaming(m.cancels, m.composeDir, name, m.tail, m.logCh)
+					startStreaming(m.cancels, m.backend, name, m.tail, m.logCh)
 				}
 			}
 			return m, nil
@@ -839,13 +851,13 @@ func (m model) getSortedVisible() []logEntry {
 
 // --- Streaming ---
 
-func startStreaming(cancels map[string]context.CancelFunc, composeDir, name string, tail int, ch chan<- logEntry) {
+func startStreaming(cancels map[string]context.CancelFunc, be backend, name string, tail int, ch chan<- logEntry) {
 	if _, exists := cancels[name]; exists {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancels[name] = cancel
-	go streamServiceLogs(ctx, composeDir, name, tail, ch)
+	go be.StreamLogs(ctx, name, tail, ch)
 }
 
 func stopStreaming(cancels map[string]context.CancelFunc, name string) {
@@ -862,11 +874,16 @@ func stopAllStreaming(cancels map[string]context.CancelFunc) {
 	}
 }
 
-func streamServiceLogs(ctx context.Context, composeDir, svc string, tail int, ch chan<- logEntry) {
-	args := []string{"compose", "logs", "-f", "--timestamps", "--tail", strconv.Itoa(tail), "--no-log-prefix", svc}
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	cmd.Dir = composeDir
+func parseTimestamp(line string) (time.Time, string) {
+	if idx := strings.IndexByte(line, ' '); idx > 0 {
+		if ts, err := time.Parse(time.RFC3339Nano, line[:idx]); err == nil {
+			return ts, sanitizeText(line[idx+1:])
+		}
+	}
+	return time.Now(), sanitizeText(line)
+}
 
+func streamCmd(ctx context.Context, cmd *exec.Cmd, svc string, ch chan<- logEntry) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return
@@ -890,53 +907,59 @@ func streamServiceLogs(ctx context.Context, composeDir, svc string, tail int, ch
 	}
 }
 
-func parseTimestamp(line string) (time.Time, string) {
-	if idx := strings.IndexByte(line, ' '); idx > 0 {
-		if ts, err := time.Parse(time.RFC3339Nano, line[:idx]); err == nil {
-			return ts, sanitizeText(line[idx+1:])
-		}
-	}
-	return time.Now(), sanitizeText(line)
-}
-
-// --- Docker Compose ---
-
-func getAllServices(composeDir string) ([]string, error) {
-	cmd := exec.Command("docker", "compose", "config", "--services")
-	cmd.Dir = composeDir
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-	var services []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+func splitLines(out string) []string {
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
-			services = append(services, line)
+			lines = append(lines, line)
 		}
 	}
-	sort.Strings(services)
-	return services, nil
+	return lines
 }
 
-func getRunningServices(composeDir string) ([]string, error) {
-	cmd := exec.Command("docker", "compose", "ps", "--format", "{{.Service}}")
-	cmd.Dir = composeDir
+// --- Docker Compose backend ---
+
+type composeBackend struct {
+	dir string
+}
+
+func (b *composeBackend) AllServices() ([]string, error) {
+	cmd := exec.Command("docker", "compose", "config", "--services")
+	cmd.Dir = b.dir
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
-	var services []string
+	svcs := splitLines(string(out))
+	sort.Strings(svcs)
+	return svcs, nil
+}
+
+func (b *composeBackend) RunningServices() ([]string, error) {
+	cmd := exec.Command("docker", "compose", "ps", "--format", "{{.Service}}")
+	cmd.Dir = b.dir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
 	seen := make(map[string]bool)
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" && !seen[line] {
+	var svcs []string
+	for _, line := range splitLines(string(out)) {
+		if !seen[line] {
 			seen[line] = true
-			services = append(services, line)
+			svcs = append(svcs, line)
 		}
 	}
-	sort.Strings(services)
-	return services, nil
+	sort.Strings(svcs)
+	return svcs, nil
+}
+
+func (b *composeBackend) StreamLogs(ctx context.Context, name string, tail int, ch chan<- logEntry) {
+	args := []string{"compose", "logs", "-f", "--timestamps", "--tail", strconv.Itoa(tail), "--no-log-prefix", name}
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Dir = b.dir
+	streamCmd(ctx, cmd, name, ch)
 }
 
 func findComposeDir() (string, error) {
@@ -958,4 +981,37 @@ func findComposeDir() (string, error) {
 		d = parent
 	}
 	return "", fmt.Errorf("no compose file found in any parent directory")
+}
+
+// --- Plain Docker backend ---
+
+type dockerBackend struct{}
+
+func (b *dockerBackend) AllServices() ([]string, error) {
+	// List all containers (running and stopped), using container name as the service identifier.
+	cmd := exec.Command("docker", "ps", "-a", "--format", "{{.Names}}")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	svcs := splitLines(string(out))
+	sort.Strings(svcs)
+	return svcs, nil
+}
+
+func (b *dockerBackend) RunningServices() ([]string, error) {
+	cmd := exec.Command("docker", "ps", "--format", "{{.Names}}")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	svcs := splitLines(string(out))
+	sort.Strings(svcs)
+	return svcs, nil
+}
+
+func (b *dockerBackend) StreamLogs(ctx context.Context, name string, tail int, ch chan<- logEntry) {
+	args := []string{"logs", "-f", "--timestamps", "--tail", strconv.Itoa(tail), name}
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	streamCmd(ctx, cmd, name, ch)
 }
