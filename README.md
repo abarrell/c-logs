@@ -7,7 +7,7 @@ Works with **Docker Compose** and **plain Docker containers**. Auto-detects whic
 ## Install
 
 ```bash
-go install github.com/abarrell/compose-logs@latest
+go install github.com/abarrell/c-logs@latest
 ```
 
 ## Usage
@@ -15,9 +15,9 @@ go install github.com/abarrell/compose-logs@latest
 Run from any directory. If a compose file is found, services come from Compose. Otherwise, all Docker containers are listed:
 
 ```bash
-compose-logs                  # start with all running services active
-compose-logs web api          # start with specific services active
-compose-logs -n 200           # show last 200 lines of history per service
+c-logs                  # start with all running services active
+c-logs web api          # start with specific services active
+c-logs -n 200           # show last 200 lines of history per service
 ```
 
 ## Controls
