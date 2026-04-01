@@ -10,6 +10,20 @@ Works with **Docker Compose** and **plain Docker containers**. Auto-detects whic
 go install github.com/abarrell/c-logs@latest
 ```
 
+If the `c-logs` command is not found after installing, you need to add Go's bin directory to your `PATH`:
+
+**Zsh** (`~/.zshrc`):
+```bash
+echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+**Bash** (`~/.bashrc`):
+```bash
+echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc
+source ~/.bashrc
+```
+
 ## Usage
 
 Run from any directory. If a compose file is found, services come from Compose. Otherwise, all Docker containers are listed:

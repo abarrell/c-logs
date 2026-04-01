@@ -42,9 +42,11 @@ var svcColors = [...]string{
 // --- Types ---
 
 type logEntry struct {
-	service string
-	text    string
-	ts      time.Time
+	service    string
+	text       string
+	ts         time.Time
+	fmtCompact []string // cached formatLogTextCompact result
+	fmtPretty  []string // cached formatLogTextPretty result
 }
 
 type svcInfo struct {
@@ -86,6 +88,10 @@ type model struct {
 	// Tracks services that have been streamed at least once, to avoid
 	// re-fetching tail history and duplicating lines on re-activation.
 	streamed map[string]bool
+
+	// Render cache – rebuilt only when visibleDirty is true.
+	visibleCache []logEntry
+	visibleDirty bool
 }
 
 // --- Messages ---
@@ -211,6 +217,35 @@ func listenForLog(ch <-chan logEntry) tea.Cmd {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	newM, cmd := m.update(msg)
+	mm := newM.(model)
+	if mm.visibleDirty {
+		mm.rebuildVisibleCache()
+	}
+	return mm, cmd
+}
+
+func (m *model) rebuildVisibleCache() {
+	n := 0
+	for _, entry := range m.lines {
+		if m.active[entry.service] {
+			n++
+		}
+	}
+	all := make([]logEntry, 0, n)
+	for _, entry := range m.lines {
+		if m.active[entry.service] {
+			all = append(all, entry)
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		return all[i].ts.Before(all[j].ts)
+	})
+	m.visibleCache = all
+	m.visibleDirty = false
+}
+
+func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -230,6 +265,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for name := range m.active {
 			startStreaming(m.cancels, m.streamed, m.backend, name, m.tail, m.logCh)
 		}
+		m.visibleDirty = true
 		return m, nil
 
 	case logMsg:
@@ -237,6 +273,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.lines) > maxLines {
 			m.lines = m.lines[maxLines/5:]
 		}
+		m.visibleDirty = true
 		return m, listenForLog(m.logCh)
 
 	case tea.MouseMsg:
@@ -295,6 +332,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.active[name] = true
 						startStreaming(m.cancels, m.streamed, m.backend, name, m.tail, m.logCh)
 					}
+					m.visibleDirty = true
 				}
 				return m, nil
 			case "a":
@@ -302,10 +340,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.active[s.name] = true
 					startStreaming(m.cancels, m.streamed, m.backend, s.name, m.tail, m.logCh)
 				}
+				m.visibleDirty = true
 				return m, nil
 			case "n":
 				stopAllStreaming(m.cancels)
 				m.active = make(map[string]bool)
+				m.visibleDirty = true
 				return m, nil
 			}
 			return m, nil
@@ -342,10 +382,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.active[s.name] = true
 				startStreaming(m.cancels, m.streamed, m.backend, s.name, m.tail, m.logCh)
 			}
+			m.visibleDirty = true
 			return m, nil
 		case "n":
 			stopAllStreaming(m.cancels)
 			m.active = make(map[string]bool)
+			m.visibleDirty = true
 			return m, nil
 		case "r":
 			stopAllStreaming(m.cancels)
@@ -356,6 +398,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					startStreaming(m.cancels, m.streamed, m.backend, s.name, m.tail, m.logCh)
 				}
 			}
+			m.visibleDirty = true
 			return m, nil
 		case "p":
 			m.prettyJSON = !m.prettyJSON
@@ -363,6 +406,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "c":
 			m.lines = nil
 			m.scrollOffset = 0
+			m.visibleDirty = true
 			return m, nil
 		case "shift+tab", "tab":
 			m.pickerOpen = true
@@ -381,6 +425,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.active[name] = true
 					startStreaming(m.cancels, m.streamed, m.backend, name, m.tail, m.logCh)
 				}
+				m.visibleDirty = true
 			}
 			return m, nil
 		}
@@ -413,17 +458,28 @@ func (m model) View() string {
 		logH = 1
 	}
 
-	// 3. Build all visual rows from visible log entries.
-	//    Each log entry may wrap to multiple visual rows. Scrolling operates
-	//    on visual rows so the output always fits exactly m.height terminal lines.
+	// 3. Build visual rows for the viewport only.
+	//    Each log entry may wrap to multiple visual rows. We first compute row
+	//    counts per entry to find the viewport window, then only build actual
+	//    row strings for entries that are on screen.
 	allVisible := m.getSortedVisible()
-	var allRows []string
 
 	if len(allVisible) == 0 {
-		allRows = append(allRows,
+		emptyRows := []string{
 			fmt.Sprintf("  %s%sSelect services to view their logs.%s", dim, italic, reset),
 			fmt.Sprintf("  %s%sPress a number to toggle, or [r] for all running services.%s", dim, italic, reset),
-		)
+		}
+		padRows := logH - len(emptyRows)
+		if padRows < 0 {
+			padRows = 0
+		}
+		row += padRows
+		for _, line := range emptyRows {
+			if row < m.height {
+				output[row] = line
+				row++
+			}
+		}
 	} else {
 		maxName := 0
 		for _, s := range m.services {
@@ -436,86 +492,140 @@ func (m model) View() string {
 			colorIdx[s.name] = i
 		}
 		prefixVisWidth := maxName + 5 // "  " + name(maxName) + " │ "
+		canWrap := m.width > 0 && prefixVisWidth < m.width-10
+		textWidth := 0
+		if canWrap {
+			textWidth = m.width - prefixVisWidth
+		}
+
+		// Phase 1: compute visual row count per entry (cheap — no string building).
+		rowCounts := make([]int, len(allVisible))
+		total := 0
+		for i, entry := range allVisible {
+			var textLines []string
+			if m.prettyJSON {
+				textLines = entry.fmtPretty
+			} else {
+				textLines = entry.fmtCompact
+			}
+			if canWrap {
+				rowCounts[i] = entryVisualRows(textLines, textWidth)
+			} else {
+				rowCounts[i] = 1
+			}
+			total += rowCounts[i]
+		}
+
+		// Phase 2: compute scroll window in visual-row space.
+		maxOffset := total - logH
+		if maxOffset < 0 {
+			maxOffset = 0
+		}
+		offset := m.scrollOffset
+		if offset > maxOffset {
+			offset = maxOffset
+		}
+		displayH := logH
+		if offset > 0 {
+			displayH--
+		}
+		endRow := total - offset
+		startRow := endRow - displayH
+		if startRow < 0 {
+			startRow = 0
+		}
+
+		// Phase 3: find which entries overlap the viewport [startRow, endRow).
+		cumRow := 0
+		firstEntry := -1
+		skipRowsInFirst := 0
+		lastEntry := -1
+		for i, rc := range rowCounts {
+			nextCum := cumRow + rc
+			if firstEntry == -1 && nextCum > startRow {
+				firstEntry = i
+				skipRowsInFirst = startRow - cumRow
+			}
+			if nextCum >= endRow {
+				lastEntry = i
+				break
+			}
+			cumRow = nextCum
+		}
+		if firstEntry == -1 {
+			firstEntry = 0
+		}
+		if lastEntry == -1 {
+			lastEntry = len(allVisible) - 1
+		}
+
+		// Phase 4: build row strings only for viewport entries.
 		indent := "  " + strings.Repeat(" ", maxName) + " " + gray + "│" + reset + " "
-		for _, entry := range allVisible {
+		var window []string
+		for ei := firstEntry; ei <= lastEntry; ei++ {
+			entry := allVisible[ei]
 			ci := colorIdx[entry.service] % len(svcColors)
 			var textLines []string
 			if m.prettyJSON {
-				textLines = formatLogTextPretty(entry.text)
+				textLines = entry.fmtPretty
 			} else {
-				textLines = formatLogTextCompact(entry.text)
+				textLines = entry.fmtCompact
 			}
 			prefix := fmt.Sprintf("  %s%-*s%s %s│%s ",
 				svcColors[ci], maxName, entry.service, reset, gray, reset)
 
-			if m.width > 0 && prefixVisWidth < m.width-10 {
-				textWidth := m.width - prefixVisWidth
+			var entryRows []string
+			if canWrap {
 				first := true
 				for _, tl := range textLines {
-					// Split embedded newlines (from pretty-printed JSON) into separate rows.
 					for _, sub := range strings.Split(tl, "\n") {
 						wrapped := ansiWrap(sub, textWidth)
 						for _, wr := range wrapped {
 							if first {
-								allRows = append(allRows, prefix+wr)
+								entryRows = append(entryRows, prefix+wr)
 								first = false
 							} else {
-								allRows = append(allRows, indent+wr)
+								entryRows = append(entryRows, indent+wr)
 							}
 						}
 					}
 				}
 			} else {
-				allRows = append(allRows, prefix+strings.Join(textLines, " "))
+				entryRows = append(entryRows, prefix+strings.Join(textLines, " "))
+			}
+
+			// Trim rows outside the viewport for first/last entry.
+			trimStart := 0
+			if ei == firstEntry {
+				trimStart = skipRowsInFirst
+			}
+			trimEnd := len(entryRows)
+			remaining := displayH - len(window)
+			if trimEnd-trimStart > remaining {
+				trimEnd = trimStart + remaining
+			}
+			window = append(window, entryRows[trimStart:trimEnd]...)
+		}
+
+		// Fill output: pad then log rows then indicator — anchored to bottom.
+		contentRows := len(window)
+		if offset > 0 {
+			contentRows++
+		}
+		padRows := logH - contentRows
+		if padRows < 0 {
+			padRows = 0
+		}
+		row += padRows
+		for _, line := range window {
+			if row < m.height {
+				output[row] = line
+				row++
 			}
 		}
-	}
-
-	// 4. Apply scroll window to visual rows.
-	total := len(allRows)
-
-	maxOffset := total - logH
-	if maxOffset < 0 {
-		maxOffset = 0
-	}
-	offset := m.scrollOffset
-	if offset > maxOffset {
-		offset = maxOffset
-	}
-
-	// Reserve one row for the scroll indicator when scrolled.
-	displayH := logH
-	if offset > 0 {
-		displayH--
-	}
-
-	end := total - offset
-	start := end - displayH
-	if start < 0 {
-		start = 0
-	}
-	window := allRows[start:end]
-
-	// Count total content rows (visible rows + indicator) to compute top padding.
-	contentRows := len(window)
-	if offset > 0 {
-		contentRows++
-	}
-	padRows := logH - contentRows
-	if padRows < 0 {
-		padRows = 0
-	}
-
-	// Fill output: pad (empty rows), then log rows, then indicator — anchored to bottom.
-	row += padRows
-	for _, line := range window {
-		if row < m.height {
-			output[row] = line
-			row++
+		if offset > 0 && row < m.height {
+			output[row] = fmt.Sprintf("  %s%s ↑ %d more lines — press G to jump to latest %s", inverted, gray, offset, reset)
 		}
-	}
-	if offset > 0 && row < m.height {
-		output[row] = fmt.Sprintf("  %s%s ↑ %d more lines — press G to jump to latest %s", inverted, gray, offset, reset)
 	}
 
 	// Overlay the service picker dropdown when open.
@@ -996,18 +1106,30 @@ func ansiTruncate(s string, maxWidth int) string {
 	return out.String()
 }
 
-// getSortedVisible returns all log lines from active services, sorted by timestamp.
-func (m model) getSortedVisible() []logEntry {
-	var all []logEntry
-	for _, entry := range m.lines {
-		if m.active[entry.service] {
-			all = append(all, entry)
+// entryVisualRows returns the number of visual (terminal) rows that a log entry
+// will occupy once formatted and wrapped to the given text width.
+func entryVisualRows(textLines []string, textWidth int) int {
+	count := 0
+	for _, tl := range textLines {
+		for _, sub := range strings.Split(tl, "\n") {
+			vlen := ansiVisualLen(sub)
+			if textWidth > 0 && vlen > textWidth {
+				count += (vlen + textWidth - 1) / textWidth
+			} else {
+				count++
+			}
 		}
 	}
-	sort.SliceStable(all, func(i, j int) bool {
-		return all[i].ts.Before(all[j].ts)
-	})
-	return all
+	if count == 0 {
+		count = 1
+	}
+	return count
+}
+
+// getSortedVisible returns the cached sorted visible log entries.
+// The cache is rebuilt in Update() via rebuildVisibleCache() whenever visibleDirty is set.
+func (m model) getSortedVisible() []logEntry {
+	return m.visibleCache
 }
 
 // --- Streaming ---
@@ -1065,8 +1187,11 @@ func streamCmd(ctx context.Context, cmd *exec.Cmd, svc string, ch chan<- logEntr
 	scanner.Buffer(make([]byte, 0, 256*1024), 256*1024)
 	for scanner.Scan() {
 		ts, text := parseTimestamp(scanner.Text())
+		entry := logEntry{service: svc, text: text, ts: ts}
+		entry.fmtCompact = formatLogTextCompact(text)
+		entry.fmtPretty = formatLogTextPretty(text)
 		select {
-		case ch <- logEntry{service: svc, text: text, ts: ts}:
+		case ch <- entry:
 		case <-ctx.Done():
 			return
 		}
