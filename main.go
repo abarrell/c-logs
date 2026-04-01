@@ -77,6 +77,15 @@ type model struct {
 	quitting     bool
 	scrollOffset int
 	prettyJSON   bool
+
+	// Service picker dropdown.
+	pickerOpen   bool
+	pickerCursor int
+	pickerScroll int // first visible index in the picker list
+
+	// Tracks services that have been streamed at least once, to avoid
+	// re-fetching tail history and duplicating lines on re-activation.
+	streamed map[string]bool
 }
 
 // --- Messages ---
@@ -128,6 +137,7 @@ func main() {
 		cancels:    make(map[string]context.CancelFunc),
 		logCh:      make(chan logEntry, 256),
 		prettyJSON: true,
+		streamed:   make(map[string]bool),
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
@@ -151,6 +161,7 @@ Auto-detects Docker Compose (if a compose file exists) or falls back to plain Do
 
 Controls (while running):
   1-9, 0        toggle service by number
+  tab           open service picker (↑↓ navigate, space/enter toggle, esc close)
   a             activate all services
   n             deactivate all services
   r             activate only running services
@@ -217,7 +228,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		for name := range m.active {
-			startStreaming(m.cancels, m.backend, name, m.tail, m.logCh)
+			startStreaming(m.cancels, m.streamed, m.backend, name, m.tail, m.logCh)
 		}
 		return m, nil
 
@@ -245,6 +256,61 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.ready {
 			return m, nil
 		}
+
+		// When picker is open, capture keys for it.
+		if m.pickerOpen {
+			switch msg.String() {
+			case "shift+tab", "tab", "esc":
+				m.pickerOpen = false
+				return m, nil
+			case "q", "ctrl+c":
+				m.pickerOpen = false
+				m.quitting = true
+				stopAllStreaming(m.cancels)
+				return m, tea.Quit
+			case "up", "k":
+				if m.pickerCursor > 0 {
+					m.pickerCursor--
+					if m.pickerCursor < m.pickerScroll {
+						m.pickerScroll = m.pickerCursor
+					}
+				}
+				return m, nil
+			case "down", "j":
+				if m.pickerCursor < len(m.services)-1 {
+					m.pickerCursor++
+					maxVis := m.pickerMaxVisible()
+					if m.pickerCursor >= m.pickerScroll+maxVis {
+						m.pickerScroll = m.pickerCursor - maxVis + 1
+					}
+				}
+				return m, nil
+			case " ", "enter":
+				if m.pickerCursor >= 0 && m.pickerCursor < len(m.services) {
+					name := m.services[m.pickerCursor].name
+					if m.active[name] {
+						m.active[name] = false
+						stopStreaming(m.cancels, name)
+					} else {
+						m.active[name] = true
+						startStreaming(m.cancels, m.streamed, m.backend, name, m.tail, m.logCh)
+					}
+				}
+				return m, nil
+			case "a":
+				for _, s := range m.services {
+					m.active[s.name] = true
+					startStreaming(m.cancels, m.streamed, m.backend, s.name, m.tail, m.logCh)
+				}
+				return m, nil
+			case "n":
+				stopAllStreaming(m.cancels)
+				m.active = make(map[string]bool)
+				return m, nil
+			}
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			m.quitting = true
@@ -274,7 +340,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "a":
 			for _, s := range m.services {
 				m.active[s.name] = true
-				startStreaming(m.cancels, m.backend, s.name, m.tail, m.logCh)
+				startStreaming(m.cancels, m.streamed, m.backend, s.name, m.tail, m.logCh)
 			}
 			return m, nil
 		case "n":
@@ -287,7 +353,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for _, s := range m.services {
 				if s.running {
 					m.active[s.name] = true
-					startStreaming(m.cancels, m.backend, s.name, m.tail, m.logCh)
+					startStreaming(m.cancels, m.streamed, m.backend, s.name, m.tail, m.logCh)
 				}
 			}
 			return m, nil
@@ -297,6 +363,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "c":
 			m.lines = nil
 			m.scrollOffset = 0
+			return m, nil
+		case "shift+tab", "tab":
+			m.pickerOpen = true
 			return m, nil
 		case "1", "2", "3", "4", "5", "6", "7", "8", "9", "0":
 			idx := int(msg.String()[0] - '1')
@@ -310,7 +379,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					stopStreaming(m.cancels, name)
 				} else {
 					m.active[name] = true
-					startStreaming(m.cancels, m.backend, name, m.tail, m.logCh)
+					startStreaming(m.cancels, m.streamed, m.backend, name, m.tail, m.logCh)
 				}
 			}
 			return m, nil
@@ -449,6 +518,73 @@ func (m model) View() string {
 		output[row] = fmt.Sprintf("  %s%s ↑ %d more lines — press G to jump to latest %s", inverted, gray, offset, reset)
 	}
 
+	// Overlay the service picker dropdown when open.
+	if m.pickerOpen && len(m.services) > 0 {
+		maxVis := m.pickerMaxVisible()
+		endIdx := m.pickerScroll + maxVis
+		if endIdx > len(m.services) {
+			endIdx = len(m.services)
+		}
+
+		// Find the longest service name for sizing.
+		maxName := 0
+		for _, s := range m.services {
+			if len(s.name) > maxName {
+				maxName = len(s.name)
+			}
+		}
+
+		// Build a sample content row to measure the exact inner visual width.
+		// Content between │…│: " ▸ ● <name padded to maxName> "
+		sampleInner := " ▸ ● " + strings.Repeat("x", maxName) + " "
+		innerW := ansiVisualLen(sampleInner)
+
+		startRow := len(header) // overlay begins right below the header
+
+		// Top border.
+		if startRow < m.height {
+			line := fmt.Sprintf("  %s%s┌%s┐%s", headerBg, gray, strings.Repeat("─", innerW), reset)
+			output[startRow] = line + clearToEnd(line, m.width)
+			startRow++
+		}
+
+		// Service rows.
+		for vi := m.pickerScroll; vi < endIdx && startRow < m.height; vi++ {
+			s := m.services[vi]
+			cur := " "
+			if vi == m.pickerCursor {
+				cur = "▸"
+			}
+			var bullet, color string
+			if m.active[s.name] {
+				bullet = "●"
+				color = boldGreen
+			} else {
+				bullet = "○"
+				color = gray
+			}
+			namePad := strings.Repeat(" ", maxName-len(s.name))
+			line := fmt.Sprintf("  %s%s│%s %s %s%s%s%s %s%s│%s",
+				headerBg, gray, reset+headerBg, cur, color, bullet, " "+s.name+namePad, reset+headerBg, gray, reset+headerBg, reset)
+			output[startRow] = line + clearToEnd(line, m.width)
+			startRow++
+		}
+
+		// Bottom border with optional scroll info.
+		scrollInfo := ""
+		if m.pickerScroll > 0 || endIdx < len(m.services) {
+			scrollInfo = fmt.Sprintf(" %d/%d ", endIdx, len(m.services))
+		}
+		dashW := innerW - len(scrollInfo)
+		if dashW < 0 {
+			dashW = 0
+		}
+		if startRow < m.height {
+			line := fmt.Sprintf("  %s%s└%s%s┘%s", headerBg, gray, strings.Repeat("─", dashW)+scrollInfo, gray, reset)
+			output[startRow] = line + clearToEnd(line, m.width)
+		}
+	}
+
 	// Safety: truncate every line to terminal width as a final guarantee against wrapping.
 	if m.width > 0 {
 		for i, line := range output {
@@ -500,7 +636,9 @@ func (m model) headerLines() []string {
 			bullet = "○"
 			color = gray
 		}
-		row.WriteString(fmt.Sprintf("  [%s] %s%s %-*s%s", key, color, bullet, maxName, s.name, reset))
+		// Build entry and pad name manually to avoid %-*s miscounting unicode.
+		namePad := strings.Repeat(" ", maxName-len(s.name))
+		row.WriteString(fmt.Sprintf("  [%s] %s%s %s%s%s", key, color, bullet, s.name, namePad, reset))
 
 		if (i+1)%cols == 0 || i == len(m.services)-1 {
 			lines = append(lines, m.bgPad(row.String(), w))
@@ -524,8 +662,9 @@ func (m model) headerLines() []string {
 	if m.prettyJSON {
 		prettyLabel = "json:on"
 	}
-	controls := fmt.Sprintf("  %s%s%s toggle %sa%sll %sn%sone %sr%sunning %sc%slear %sp%s %s %s↑↓%s scroll %sG%s latest %sq%suit",
+	controls := fmt.Sprintf("  %s%s%s toggle %stab%s picker %sa%sll %sn%sone %sr%sunning %sc%slear %sp%s %s %s↑↓%s scroll %sG%s latest %sq%suit",
 		bold, keyRange, reset,
+		bold, reset,
 		bold, reset, bold, reset, bold, reset, bold, reset,
 		bold, reset, prettyLabel,
 		bold, reset, bold, reset, bold, reset)
@@ -574,6 +713,28 @@ func (m model) headerRowCount() int {
 	}
 	svcRows := (len(m.services) + cols - 1) / cols
 	return 1 + svcRows + 1 + 1 // title + service rows + controls + border
+}
+
+// pickerMaxVisible returns the max number of services visible in the picker dropdown.
+func (m model) pickerMaxVisible() int {
+	maxH := m.height - m.headerRowCount() - 2 // 2 for picker border top/bottom
+	if maxH < 3 {
+		maxH = 3
+	}
+	if maxH > len(m.services) {
+		maxH = len(m.services)
+	}
+	return maxH
+}
+
+// clearToEnd pads the overlay line to cover any underlying content up to the terminal width.
+func clearToEnd(overlay string, width int) string {
+	visLen := ansiVisualLen(overlay)
+	pad := width - visLen
+	if pad <= 0 {
+		return ""
+	}
+	return strings.Repeat(" ", pad)
 }
 
 // logAreaHeight returns how many terminal rows are available for log output.
@@ -851,13 +1012,18 @@ func (m model) getSortedVisible() []logEntry {
 
 // --- Streaming ---
 
-func startStreaming(cancels map[string]context.CancelFunc, be backend, name string, tail int, ch chan<- logEntry) {
+func startStreaming(cancels map[string]context.CancelFunc, streamed map[string]bool, be backend, name string, tail int, ch chan<- logEntry) {
 	if _, exists := cancels[name]; exists {
 		return
 	}
+	t := tail
+	if streamed[name] {
+		t = 0 // already have history, only stream new lines
+	}
+	streamed[name] = true
 	ctx, cancel := context.WithCancel(context.Background())
 	cancels[name] = cancel
-	go be.StreamLogs(ctx, name, tail, ch)
+	go be.StreamLogs(ctx, name, t, ch)
 }
 
 func stopStreaming(cancels map[string]context.CancelFunc, name string) {
