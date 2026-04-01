@@ -22,6 +22,7 @@ compose-logs -n 200           # show last 200 lines of history per service
 
 ## Controls
 
+
 | Key | Action |
 |---|---|
 | `1-9`, `0` | Toggle service by number |
