@@ -1,4 +1,4 @@
-# compose-logs
+# c-logs
 
 An interactive TUI for streaming Docker logs. Toggle services on/off, scroll through history, and pretty-print JSON structured logs — all from your terminal.
 
