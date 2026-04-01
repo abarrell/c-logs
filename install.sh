@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
-REPO="github.com/abarrell/compose-logs"
-BIN="compose-logs"
+REPO="github.com/abarrell/c-logs"
+BIN="c-logs"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
