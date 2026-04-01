@@ -1,5 +1,7 @@
 # compose-logs
 
+<img width="1507" height="625" alt="Screenshot 2026-03-31 at 9 27 39 PM" src="https://github.com/user-attachments/assets/f0b7490a-9b1f-4de8-8d5c-4b4928de5264" />
+
 An interactive TUI for streaming Docker Compose logs. Toggle services on/off, scroll through history, and pretty-print JSON structured logs — all from your terminal.
 
 ## Install
@@ -19,6 +21,7 @@ compose-logs -n 200           # show last 200 lines of history per service
 ```
 
 ## Controls
+
 
 | Key | Action |
 |---|---|
